@@ -1,6 +1,6 @@
 # media-fix
 
-`media-fix` is a Perl-based utility (v1.0.4) designed to repair, synchronize, and standardize metadata (EXIF/XMP) and filenames for photo and video collections. It handles complex timezone offsets and restores missing metadata using filename patterns.
+`media-fix` is a Perl-based utility designed to repair, synchronize, and standardize metadata (EXIF/XMP) and filenames for photo and video collections. It handles complex timezone offsets and restores missing metadata using filename patterns.
 
 ## Usage
 
@@ -58,8 +58,7 @@ Some cleanup is applied to the `remaineder`, like removing trailing `~1, ..., _0
 
 If you want to rename only with the `YYYYMMDD_HHMMSS` pattern, use the `-strict` parameter.
 
-**Note for WhatsApp:** The name/date is completely wrong, not corresponding to the actual date of the asset, but when the file was shared with you.
-
+**Note for WhatsApp:** The name/date is completely wrong, not corresponding to the actual date of the asset, but when the file was shared with you:
 As we have no other choice we still take it as reference.
 
 The hour/minuste/seconds will be computed from the trailing digits after `WA` as a number of seconds added to `12:00:00`, the goal being to have distinct filenames.
@@ -67,42 +66,80 @@ The hour/minuste/seconds will be computed from the trailing digits after `WA` as
 WA00001 -> 12:00:01
 WA03670 -> 13:01:10
 ```
-
+```bash
+> media-fix -tag -skiptag IMG-20250714-WA1234.jpg
+'./IMG-20250714-WA1234.jpg' tagged to '2025:07:14 12:20:34.000+02:00'
+```
 
 ### Forcing Incorrect Metadata
-By combining filename recognition with the `-skiptag` parameter, you can force or reset existing but incorrect EXIF tags. Simply rename your image/video file with the desired date pattern and run the command with both `-tag` and `-skiptag` to overwrite the internal metadata.
+By combining filename recognition with the `-skiptag` parameter, you can force or reset existing but incorrect EXIF tags.
+
+Simply rename your image/video file first with the desired date pattern you want and then run the command with both `-tag` and `-skiptag` to overwrite the internal metadata.
 
 ### XMP Sidecar
 This was initially designed for **Immich** to generate an external XMP sidecar file having the correct `DateTimeOriginal`.
 
 With this method you can fix your library without touching your assets. Note however that Immich is currently (v2.6.1) not handling XMP files efficiently.
 ```bash
-media-fix -xmp
+> media-fix -xmp -run 20251021_214337.jpg
+'./20251021_214337.jpg' XMP file written
+
+> cat 20251021_214337.jpg.xmp 
+<?xpacket begin='﻿' id='...'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/' x:xmptk='Image::ExifTool 13.50'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+
+ <rdf:Description rdf:about=''
+  xmlns:exif='http://ns.adobe.com/exif/1.0/'>
+  <exif:DateTimeOriginal>2025-10-21T21:43:37.000+02:00</exif:DateTimeOriginal>
+ </rdf:Description>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>
 ```
 
 You will need to generate all your XMP, then in Immich navigate to _Administration > Job Queues > Sidecar Metadata > Discover_.
 
 This will make your XMP files visible for Immich and will trigger the _Extract Metadata_ (unfortunately on *ALL* you assets.
 
-**Note:** If an existing XMP is found, it will *not* be rewritten/updated.
+**Note:** If an existing XMP is found, it will *not* be rewritten/updated. Also if the file has correct Exif tags, the XMP is not written as not required.
+
+
+### Restoring broken assets library
+This tool can also be used to restore the correct filenames froma damaged filesystem.
+
+After recovering the files with tolls like `testdisk/photorec`, you can rename images/videos from their EXIF tags using the `-rename` tag:
+```
+> media-fix -tag -touch -rename has-good-exif 
+'./has-good-exif' touched to '2023:09:14 17:20:02+02:00' renamed to '20230914_172002 has-good-exif.jpg'
+```
 
 ---
 
 ## Examples
 
-**Dry-Run (Preview only):**
+**Dry-Run (preview only):**
 ```bash
-media-fix -tag -rename -touch
+media-fix -tag -touch -rename
 ```
 
-**Full Execution with Logging:**
+**Full Execution:**
 ```bash
-media-fix -tag -rename -touch -run -verbose
+media-fix -tag -touch -rename -run
 ```
 
-**Force Update from Filenames:**
+**Full Execution with logging:**
 ```bash
-media-fix -tag -skiptag -run
+> media-fix -tag -verbose 20251021_214337.jpg
+   TimeZone settings: system 'default'='Europe/Paris'
+Processing image './20251021_214337.jpg' 
+   EXIF Tag read: extratag is missing, using default 'SubSecTimeOriginal'='0'
+   EXIF Tag read: extratag is missing, using default 'OffsetTimeOriginal'='Europe/Paris'
+   EXIF Tag read: TZ Date 'DateTimeOriginal'='2025:10:21 21:43:37'
+   EXIF Tag write: TZ Date 'DateTimeOriginal, SubSecTimeOriginal, OffsetTimeOriginal'='2025:10:21 21:43:37, 0, +02:00'
+   EXIF Tag write: TZ Date 'CreateDate, SubSecTimeDigitized, OffsetTimeDigitized'='2025:10:21 21:43:37, 0, +02:00'
+   EXIF Tag write: TZ Date 'ModifyDate, SubSecTime, OffsetTime'='2025:10:21 21:43:37, 0, +02:00'
+   Finalize apply: tagged to '2025:10:21 21:43:37.000+02:00'
 ```
 
 ---
