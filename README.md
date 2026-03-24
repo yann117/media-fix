@@ -54,7 +54,7 @@ If EXIF data is missing, the tool extracts dates from usual filename:
 * Folders: Can infer dates from folder names (e.g., `20230512_Trip`).
 
 Anything found after a matching date will be kept as `remainder` and used for the final name.
-Some cleanup is applied to the `remaineder`, like removing trailing `~1, ..., _01, ..., _HDR`
+Some cleanup is applied to the `remainder`, like removing trailing `~1, ..., _01, ..., _HDR`
 
 If you want to rename only with the `YYYYMMDD_HHMMSS` pattern, use the `-strict` parameter.
 
