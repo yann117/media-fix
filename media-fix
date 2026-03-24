@@ -1,0 +1,631 @@
+#!/usr/bin/perl
+
+our $VERSION = '1.0.6';
+
+# TODO possible bug when running with a single parameter
+# TODO bug with "preserve" not working, so have to rewrite FileModifyDate (can be confusing in the report)
+
+#### Specific Fixes ##########################################################################
+package fixes;
+  ##
+  # Fix for DJI Action Cam: bug with DST, 1h shift TODO
+  ##
+  sub fixDJIVideo {
+    my ($item) = @_;
+    my $isDJI;
+    my $tagDJI = $item->{exifTool}->GetValue('OriginalFilePath');
+    if ((defined $tagDJI) && ($tagDJI =~ /DJI/)) {
+      $isDJI = 1;
+    }
+  }
+
+  ##
+  # Fix for Panasonic Camera adding wrong MakerNotes timestamps -> Not needed when setting the File DateTimeOriginal
+  ##
+  sub fixPanasonicImage {
+    my ($item) = @_;
+    my $panasonicTime = $item->{exifTool}->GetValue('MakerNotes:Panasonic:TimeStamp');
+    if (defined $panasonicTime) {
+    }
+  }
+  
+## Utilities #################################################################################
+package utils;
+use strict;
+use warnings;
+use Cwd 'abs_path';
+use Getopt::Long;
+use DateTime::TimeZone;
+
+our ($verbose, $rename, $strict, $touch, $tag, $skiptag, $xmp, $run, $tz);
+
+our $TYPE_IMAGE    = 'image';
+our $TYPE_VIDEO    = 'video';
+our $TYPE_FOLDER   = 'folder';
+
+our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
+
+  sub init {
+    GetOptions('verbose' => \$verbose, 'rename' => \$rename, 'strict' => \$strict, 'touch' => \$touch, 'tag' => \$tag, 'skiptag' => \$skiptag, 'xmp' => \$xmp, 'run' => \$run, 'tz=s' => \$tz) or die "Invalid options\n";
+    @ARGV = (abs_path('.')) unless @ARGV;
+
+    $CWD = abs_path('.');
+    $UTC_TZ   = DateTime::TimeZone->new(name => 'UTC');
+    $LOCAL_TZ = DateTime::TimeZone->new(name => 'local');
+    $DEFAULT_TZ = $tz ? DateTime::TimeZone->new(name => $tz) : $LOCAL_TZ;
+
+    if ($rename || $touch || $tag || $xmp) {
+      open(FH, '>', 'process.log') or die "Cannot open 'process.log' $!" if ($verbose);
+      if ($tz) {
+        logTask('INFO', 'TimeZone', 'settings', 'system ' . addKeyValue('default', undef, $LOCAL_TZ->{name}) . ', overriden by parameter', '-tz', $DEFAULT_TZ->{name});
+      } else {
+        logTask('INFO', 'TimeZone', 'settings', 'system', 'default', $LOCAL_TZ->{name});
+      }
+    } else {
+      print "Usage:\n";
+      print "    media-fix -tag|-touch|-rename|-xmp [-run][-strict][-skiptag][-tz='str'][-verbose] [FILE]\n";
+      print "\n";
+      print "    -tag      : rewrite incomplete EXIF date tags, usually from the filename\n";
+      print "    -skiptag  : ignore EXIF dates, to use with -tag and force new dates from the filename\n";
+      print "    -touch    : change file modification date according to target date (EXIF or failback from filename)\n";
+      print "    -rename   : change filename according to target date\n";
+      print "    -strict   : renaming only with strict format 'YYYYMMDD_HHMMSS'\n";
+      print "    -xmp      : write a XMP sidecar with the 'FileModifyDate' with the correct timezone when required (invalid EXIF)\n";
+      print "    -run      : apply changes, by default it is in dry-run mode\n";
+      print "    -tz='str' : change default tz to 'str', ex: 'Europe/Lisbon' (default is system 'local')\n";
+      print "    -verbose  : write verbose details, also save in log\n";
+      print "    FILE      : optional, if not specified will process the whole current tree structure\n";
+      exit 1;
+    }
+  }
+  
+  sub shutdown {
+    close(FH) if $verbose;
+  }
+  
+  sub addHighlight { return "\e[93m$_[0]\e[0m"; }
+  sub addValue { return "'\e[96m$_[0]\e[0m'"; }
+  sub addKeyValue {
+    my ($key, $sep, $value) = @_;
+    if (defined $value) {
+      return addHighlight($key) . $sep . addValue($value) if defined $sep;
+      return "'" . addHighlight($key) . "'=" . addValue($value);
+    }
+    else { return addHighlight($key); }
+  }
+
+  sub buildOperationsResult {
+    my ($operations) = @_;
+    my $result = '';
+    $result .= $operations->{tag} . ' ' if defined $operations->{tag};
+    $result .= $operations->{touch} . ' ' if defined $operations->{touch};
+    $result .= $operations->{rename} . ' ' if defined $operations->{rename};
+    $result .= $operations->{xmp} . ' ' if defined $operations->{xmp};
+    return $result;
+  }
+  
+  ##
+  # Log a message
+  ##
+  sub logMsg {
+    my ($level, $shortname, $msg) = @_;
+
+    my $output;
+    if ($level eq 'WARN') { $output .= "\e[93m"; }
+    elsif ($level eq 'ERROR') { $output .= "\e[91m"; }
+    $output .= "'$shortname' " if defined $shortname;
+    $output .= "\e[0m" if ($level eq 'WARN' || $level eq 'ERROR');
+    $output .= "$msg";
+    $output .= "\n";
+    
+    print $output;
+    print FH $output if $verbose;
+  }
+  
+  ##
+  # Log a subtask message (verbose report)
+  ##
+  sub logTask {
+    my ($level, $source, $action, $msg, $target, $value) = @_;
+
+    my $output;
+    if ($level eq 'HEADER') { $output .= "\e[1m"; }
+    elsif ($level eq 'WARN') { $output .= " \e[7m\e[93m \e[0m "; }
+    elsif ($level eq 'ERROR') { $output .= " \e[7m\e[91m \e[0m "; }
+    elsif ($level eq 'FOOTER') { $output .= " \e[7m\e[92m \e[0m "; }
+    else { $output .= "   "; }
+    $output .= "$source " if defined $source;
+    $output .= "\e[95m$action:\e[0m " if defined $action;
+    if ($level eq 'ERROR') {
+      $output .= "\e[91m$msg\e[0m ";
+    } else {
+      $output .= "$msg ";
+    }
+    $output .= utils::addKeyValue($target, undef, $value) if defined $target;
+    $output .= "\e[0m" if ($level eq 'HEADER');
+    $output .= "\n";
+    
+    if ($verbose) {
+      print $output;
+      print FH $output;
+    }
+  }
+  
+  sub logtResult {
+    my ($level, $shortname, $source, $action, $msg, $target, $value) = @_;
+    
+    if ($verbose) {
+        logTask($level, $source, $action, $msg, $target, $value);
+    } else {
+        logMsg($level, $shortname, $msg);
+    }
+  }
+  
+  sub dateStringStripMillis { my $s = shift; $s =~ s/\.\d+//; $s }
+  sub getOffsetName { return ref($_[0]) ? $_[0]->{name} : $_[0]; }
+
+## Class Item ################################################################################
+package Item;
+use strict;
+use warnings;
+use DateTime;
+use Cwd 'abs_path';
+use File::stat;
+use File::Basename qw(fileparse);
+use Image::ExifTool qw(ImageInfo);
+
+  sub new {
+    my ($class, $file, $overrideTZ, $ignoreReason) = @_;
+    die "file is required" unless $file;
+    
+    $file = abs_path($file);
+    my ($name, $path, $suffix) = fileparse($file, qr/\.[^.]*/);
+    my $self = {
+        file            => $file,
+        shortname       => ($file =~ s|^\Q$CWD\E/?|./|r),
+        basename        => $name,
+        path            => $path,
+        remainder       => undef,
+        extension       => lc($suffix),
+        defaultTZ       => undef,
+        overrideTZ      => $overrideTZ,
+        type            => '',
+        exiftool        => undef,
+        fileModifyDate  => undef,             # WARNING: reading/writing this 'FileModifyDate' tag is using environment TZ
+        error           => undef,
+        ignoreReason    => $ignoreReason,
+        target          => undef,
+        operations      => { tag => undef, rename => undef, touch => undef, xmp => undef },
+        noop            => { tag => undef, rename => undef, touch => undef, xmp => undef },
+    };
+
+    bless $self, $class;
+    $self->{exifTool} = new Image::ExifTool;
+    if ($self->{exifTool}->ExtractInfo($self->{file})) {
+      $self->{fileModifyDate} = utils::dateStringStripMillis($self->{exifTool}->GetValue('FileModifyDate'));
+      if (-f $self->{file}) {
+        my $exifMimeType = $self->{exifTool}->GetValue('MIMEType');
+        if (defined $exifMimeType) {
+          if ($exifMimeType =~ /^image/) {
+            $self->{type} = $TYPE_IMAGE;
+            $self->{extension} = '.jpg' if $suffix eq '';
+          } elsif ($exifMimeType =~ /^video/) {
+            $self->{type} = $TYPE_VIDEO;
+            $self->{extension} = '.mov' if $suffix eq '';
+          }
+        } else { $self->{error} = 'could not determine MIME type'; }
+      } elsif (-d $self->{file}) {
+        $self->{type} = $TYPE_FOLDER;
+      }
+    } else {
+      $self->{error} = $self->{exifTool}->{ERRSTR} || $self->{exifTool}->GetValue('Error') || $self->{exifTool}->GetValue('Warning') || 'could not extract EXIF data';
+    }
+    return $self;
+  }
+  
+  sub setTargetDate {
+    my ($self, $date, $millis, $offset, $convertOffset) = @_;
+
+    my ($year, $month, $day, $hour, $min, $sec) = $date =~ /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
+    my $dt = DateTime->new(year => $year, month => $month, day => $day, hour => $hour, minute => $min, second => $sec, nanosecond => ($millis * 1_000_000), time_zone => $offset);
+    $dt->set_time_zone($convertOffset) if (defined $convertOffset);
+    $offset = $dt->strftime('%z') =~ s/^([+-]\d{2})(\d{2})$/$1:$2/r;
+    $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
+    my $dtStr = sprintf "%s.%03d%s", $date, substr($millis, 0, 3), $offset;
+
+    my $dtUTC = $dt->clone()->set_time_zone($UTC_TZ);
+    my $dateUTC = sprintf "%s.%03d%s", $dtUTC->strftime('%Y:%m:%d %H:%M:%S'), int($dtUTC->nanosecond/1_000_000), "+00:00";
+    my $dtSystem = $dt->clone()->set_time_zone($LOCAL_TZ);
+    my $dateSystem = sprintf "%s.%03d%s", $dtSystem->strftime('%Y:%m:%d %H:%M:%S'), int($dtSystem->nanosecond/1_000_000), $dtSystem->strftime('%z') =~ s/^([+-]\d{2})(\d{2})$/$1:$2/r;
+    $dateSystem = utils::dateStringStripMillis($dateSystem);
+
+    $self->{target}->{base}     = $date;                                                                                # 2022:08:26 15:41:19
+    $self->{target}->{full}     = $dtStr;                                                                               # 2022:08:26 15:41:19.421+01:00
+    $self->{target}->{millis}   = $millis;                                                                              # 421
+    $self->{target}->{offset}   = $offset;                                                                              # +01:00
+    $self->{target}->{asFile}   = $dt->strftime('%Y%m%d_%H%M%S');                                                       # 20220826_154119
+    $self->{target}->{asFileMS} = sprintf '%s.%03d', $self->{target}->{asFile}, substr($millis, 0, 3);                  # 20220826_154119.421
+    $self->{target}->{asUTC}    = $dateUTC;                                                                             # 2022:08:26 14:41:19.421+00:00
+    $self->{target}->{asSystem} = $dateSystem;                                                                          # 2022:08:26 16:41:19+02:00        (stripping millis as not all filesystem supports them)
+    
+    #print "DBG TargetDate base: '$self->{target}->{base}' full: '$self->{target}->{full}' asUTC: '$self->{target}->{asUTC}' asSystem: '$self->{target}->{asSystem}' asFile: '$self->{target}->{asFile}' asFileMS: '$self->{target}->{asFileMS}'\n";
+  }
+  
+  ##
+  # Get the default timezone from either: the host system, the -tz parameter, the presence of a .tz* file in the folder. Resolved and logged at first use.
+  ##
+  sub getDefaultTimezone {
+    my ($self) = @_;
+    return $self->{defaultTZ} if $self->{defaultTZ};
+
+    if ($tz) {
+      $self->{defaultTZ} = $DEFAULT_TZ;
+      utils::logTask('INFO', 'TimeZone', 'settings', 'overriden by parameter', '-tz', $tz);
+    } elsif (defined $self->{overrideTZ}) {
+      $self->{defaultTZ} = $self->{overrideTZ};
+      utils::logTask('INFO', 'TimeZone', 'settings', 'overriden by folder configuration', 'blabla', $self->{overrideTZ}->name);
+    } else {
+      $self->{defaultTZ} = $DEFAULT_TZ;
+    }
+    return $self->{defaultTZ};
+  }
+  
+  ##
+  # Try parsing a date from an item filename and the remainder name for rename. Don't override tartgetDate if already extracted
+  ##
+  sub getDateFromName {
+    my ($self) = @_;
+    my $finalDate; my $finalMillis = 0; my $finalOffset;
+    if ($self->{type} eq $TYPE_FOLDER) {
+      my ( $year, $month, $day ) = $self->{basename} =~ /(\d{4})(\d{0,2})(\d{0,2}).*/;
+      if (!defined $year || $year eq '' || $year eq '0000') { $year = '2000'; }
+      if (!defined $month || $month eq '' || $month eq '00') { $month = '01'; }
+      if (!defined $day || $day eq '' || $day eq '00') { $day = '01'; }
+      $finalDate = sprintf "%04d:%02d:%02d 00:00:00", $year, $month, $day;
+    } else {
+      if ( $self->{basename} =~ /.*(\d{4})(\d{2})(\d{2}).?(\d{2})(\d{2})(\d{2})(?:\.?(\d{1,3})\d*)?([+-]\d{4})?(.*)?$/ ) {
+        my ( $year, $month, $day, $hour, $min, $sec, $millis, $offset, $remainder ) = ( $1, $2, $3, $4, $5, $6, $7, $8, $9 );
+        if (defined $remainder && ! $strict) {
+          $remainder =~ s/(~\d+|_HDR|_\d+)$//i;
+          if ($remainder ne '') {
+            $self->{remainder} = $remainder;
+            utils::logTask('INFO', 'Filename', 'parse', 'partial name saved as', 'remainder', $remainder);
+          }
+        }
+        $finalDate = sprintf "%04d:%02d:%02d %02d:%02d:%02d", $year, $month, $day, $hour, $min, $sec;
+        $finalMillis = $millis if defined $millis;
+        $finalOffset = $offset if defined $offset;
+      } elsif ( $self->{basename} =~ /.*(\d{4})(\d{2})(\d{2})-WA(\d*)?.*/ ) {    # fallback to WhatsApp file format -> IMG-20251130-WA0003.jpg
+        my ( $year, $month, $day, $sec ) = ( $1, $2, $3, $4 );
+        $sec //= 0;
+        $finalDate = sprintf "%04d:%02d:%02d %02d:%02d:%02d", $year, $month, $day, 12+int($sec/3600), int(($sec%3600)/60), $sec%60;
+      } else {
+        utils::logTask('WARN', 'Filename', 'parse', 'not matching a timestamp');
+        if (! $strict) {
+          $self->{remainder} = ' ' . $self->{basename};
+          utils::logTask('INFO', 'Filename', 'parse', 'partial name saved as', 'remainder', $self->{remainder});
+        }
+        return;
+      }
+    }
+    if (!defined $self->{target}) {
+      $self->setTargetDate($finalDate, $finalMillis, $finalOffset//$self->getDefaultTimezone());
+      utils::logTask('INFO', 'Filename', 'parse', 'matching timestamp extracted', 'targetDate', $self->{target}->{full});
+    }
+  }
+
+  ##
+  # Extract a date from EXIF
+  ##
+  sub getDateFromEXIF {
+    my ($self, $dateTag, $extraTag) = @_;
+    if (defined $self->{target}) { return; }
+    
+    $self->{needTag} = 1;
+    my $ExifDate = $self->{exifTool}->GetValue($dateTag);
+    if (defined $ExifDate) {
+      # some bugged device report this false date
+      if ($ExifDate =~ /^2002:12:08 12:00:00/ || $ExifDate eq '0000:00:00 00:00:00' || $ExifDate eq '') {
+        utils::logTask('WARN', 'EXIF Tag', 'read', 'value is invalid', $dateTag, $ExifDate);
+      } else {
+        if ($self->{type} eq $TYPE_VIDEO) {
+          my $targetOffset = $self->getDefaultTimezone();
+          $self->setTargetDate($ExifDate, 0, $UTC_TZ, $targetOffset);
+          utils::logTask('INFO', 'EXIF Tag', 'read', 'UTC Date', $dateTag, $ExifDate);
+          utils::logTask('INFO', 'TimeZone',  'conversion', "from 'UTC' to '$targetOffset->{name}'", 'targetDate', $self->{target}->{full});
+          $self->{needTag} = undef;
+        } else {
+          my ($ExifMillis, $ExifOffset, $msg, $value);
+          $msg .= "$dateTag";
+          $value .= "$ExifDate";
+          if (defined $extraTag) {
+            $ExifMillis = $self->{exifTool}->GetValue('SubSec' . $extraTag);
+            $ExifOffset = $self->{exifTool}->GetValue('Offset' . $extraTag);
+            if (defined $ExifMillis && defined $ExifOffset) {
+              $self->{needTag} = undef;
+            }
+          }
+          if (defined $ExifMillis) {
+            $msg .= ", SubSec$extraTag";
+            $value .= ", $ExifMillis";
+          } else {
+            $ExifMillis = 0;
+            utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using default', "SubSec$extraTag", $ExifMillis);
+          }
+          if (defined $ExifOffset) {
+            $msg .= ", Offset$extraTag";
+            $value .= ', ' . utils::getOffsetName($ExifOffset);
+          } else {
+            $ExifOffset = $self->getDefaultTimezone();
+            utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using default', "Offset$extraTag", utils::getOffsetName($ExifOffset));
+          }
+          $self->setTargetDate($ExifDate, $ExifMillis, $ExifOffset);
+          utils::logTask('INFO', 'EXIF Tag', 'read', 'TZ Date', $msg, $value);
+        }
+      }
+    } else {
+      utils::logTask('WARN', 'EXIF Tag', 'read', 'tag is missing', $dateTag);
+    }
+  }
+  
+  ##
+  # Set a date to EXIF
+  ##
+  sub setDateToEXIF {
+    my ($self, $ExifDate, $dateTag, $extraTag) = @_;
+    $self->{exifTool}->SetNewValue($dateTag => $ExifDate, 'Protected' => 1);
+    if (defined $extraTag) {
+      $self->{exifTool}->SetNewValue('SubSec' . $extraTag => $self->{target}->{millis}, 'Protected' => 1);
+      $self->{exifTool}->SetNewValue('Offset' . $extraTag => $self->{target}->{offset}, 'Protected' => 1);
+      utils::logTask('INFO', 'EXIF Tag', 'write', 'TZ Date', "$dateTag, SubSec$extraTag, Offset$extraTag", "$ExifDate, $self->{target}->{millis}, $self->{target}->{offset}");
+    } else {
+      utils::logTask('INFO', 'EXIF Tag', 'write', 'UTC Date', $dateTag, $ExifDate);
+    }
+  }
+  
+  ##    
+  # Find an available filename, avoid adding millis if not required
+  ##
+  sub validateFilename {
+    my ($self) = @_;
+    my $shortTargetName = $self->{target}->{asFile} . ($self->{remainder}//'') . $self->{extension};
+    my $shortMillisTargetName = $self->{target}->{asFileMS} . ($self->{remainder}//'') . $self->{extension};
+    if ($self->{basename} . $self->{extension} eq $shortTargetName) {
+      utils::logTask('INFO', 'Filename', 'validate', 'is already correct', 'target', $shortTargetName);
+      return;
+    }
+    return $shortTargetName if (! -e $self->{path}.$shortTargetName);
+
+    if ($self->{basename} . $self->{extension} eq $shortMillisTargetName) {
+      utils::logTask('INFO', 'Filename', 'validate', 'is already correct with millis', 'target', $shortMillisTargetName);
+      return;
+    }
+    if (! -e $self->{path}.$shortMillisTargetName) {
+      return $shortMillisTargetName;
+    } else {
+      utils::logTask('ERROR', 'Filename', 'validate', 'found duplicate item with same date.millis', 'target', $shortMillisTargetName);
+      return; # required or will return 1 from the previous statement
+    }
+  }
+
+  ##
+  # Common operation managing the file modify date
+  ##  
+  sub processTouch {
+    my ($self) = @_;
+    if ($touch) {
+      if ($self->{fileModifyDate} ne $self->{target}->{asSystem} || defined $self->{operations}->{tag} || defined $self->{operations}->{rename}) {
+          $self->{exifTool}->SetNewValue('FileModifyDate' => $self->{target}->{asSystem}, 'Protected' => 1);
+          utils::logTask('INFO', 'EXIF Tag', 'write', 'touched to date', 'FileModifyDate', $self->{target}->{asSystem});
+          $self->{operations}->{touch} = utils::addKeyValue('touched', ' to ', $self->{target}->{asSystem}) if ($self->{fileModifyDate} ne $self->{target}->{asSystem});
+      } else {
+        $self->{noop}->{touch} = utils::addKeyValue('modify date', ' is ', 'OK');
+      }
+    }
+  }
+  
+  ##
+  # Process a folder
+  ##
+  sub processFolder {
+    my ($self) = @_;
+    $self->getDateFromName();
+    if (!defined $self->{target}) {
+      $self->{error} = 'no valid date found';
+      return;
+    }
+    
+    $self->processTouch();
+  }
+  
+  ##
+  # Process a file, find the creation date
+  ##
+  sub processFile {
+    my ($self) = @_;
+
+    if ($skiptag) {
+      utils::logTask('WARN', 'EXIF Tag', 'skipped', 'not reading tags due to parameter', '-skiptag');
+    } else {
+      if ($self->{type} eq $TYPE_IMAGE) {
+        $self->getDateFromEXIF('DateTimeOriginal', 'TimeOriginal');
+      } else {
+        $self->getDateFromEXIF('MediaCreateDate');
+        $self->getDateFromEXIF('MediaModifyDate');
+        $self->getDateFromEXIF('TrackCreateDate');
+        $self->getDateFromEXIF('TrackModifyDate');
+      }
+      $self->getDateFromEXIF('CreateDate', 'TimeDigitized');
+      $self->getDateFromEXIF('ModifyDate', 'Time');
+    }
+    $self->getDateFromName();
+    if (!defined $self->{target}) {
+      $self->{error} = 'no valid date found';
+      return;
+    }
+
+    if ($tag) {
+      if (defined $self->{needTag} || $skiptag) {
+        my $ExifDate = ( $self->{type} eq $TYPE_VIDEO ) ? $self->{target}->{asUTC} : $self->{target}->{base};
+        if ($self->{type} eq $TYPE_IMAGE) {
+          $self->setDateToEXIF($ExifDate, 'DateTimeOriginal', 'TimeOriginal');
+          $self->setDateToEXIF($ExifDate, 'CreateDate', 'TimeDigitized');
+          $self->setDateToEXIF($ExifDate, 'ModifyDate', 'Time');
+        } else {
+          $self->setDateToEXIF($ExifDate, 'QuickTime:CreateDate');
+          $self->setDateToEXIF($ExifDate, 'QuickTime:ModifyDate');
+          $self->setDateToEXIF($ExifDate, 'QuickTime:MediaCreateDate');
+          $self->setDateToEXIF($ExifDate, 'QuickTime:MediaModifyDate');
+          $self->setDateToEXIF($ExifDate, 'QuickTime:TrackCreateDate');
+          $self->setDateToEXIF($ExifDate, 'QuickTime:TrackModifyDate');
+          #$self->setDateToEXIF($self->{target}->{full}, "XMP-xmp:CreateDate"); Note: could possibly add this one
+        }
+        $self->{operations}->{tag} = utils::addKeyValue('tagged', ' to ', $self->{target}->{full});
+      } else {
+        $self->{noop}->{tag} = utils::addKeyValue('tags', ' are ', 'OK');
+      }
+    }
+
+    if ($rename) {
+      my $filename = $self->validateFilename();
+      if (defined $filename) {
+        $self->{exifTool}->SetNewValue('FileName' => $filename, 'Protected' => 1);
+        utils::logTask('INFO', 'EXIF Tag', 'write', 'renamed to', 'Filename', $filename);
+        $self->{operations}->{rename} = utils::addKeyValue('renamed', ' to ', $filename);
+      } else {
+        $self->{noop}->{rename} = utils::addKeyValue('filename', ' is ', 'OK');
+      }
+    }
+
+    $self->processTouch();
+    
+    if ($xmp) {
+      if (defined $self->{needTag}) {
+        if ($self->{type} eq $TYPE_IMAGE) {
+          my $xmp_file = "$self->{file}.xmp";
+          if (! -e $xmp_file) {
+            if ($run) {
+              my $xmpTool = Image::ExifTool->new;
+              $xmpTool->SetNewValue('XMP-exif:DateTimeOriginal' => $self->{target}->{full});
+              $xmpTool->WriteInfo(undef, $xmp_file)
+                or utils::logTask('ERROR', 'XMP file', 'write', 'file failed', 'error', $xmpTool->GetValue('Error'));
+              utils::logTask('INFO', 'XMP file', 'write', 'XMP-exif details to', 'file', "$self->{shortname}.xmp");
+            }
+            $self->{operations}->{xmp} = utils::addHighlight('XMP file written');
+          } else {
+            $self->{operations}->{xmp} = utils::addHighlight('XMP file already exist, not overwriting');
+          }
+        }
+      } else {
+        $self->{noop}->{xmp} = utils::addHighlight('no XMP file required');
+      }
+    }
+  }
+
+  sub applyOperations {
+    my ($self) = @_;
+    if (defined $self->{error}) {
+      utils::logtResult('ERROR', $self->{shortname}, 'Critical', 'failed', $self->{error});
+    } else {
+      my $ops = utils::buildOperationsResult($self->{operations});
+      if ($ops ne '') {
+        if ($run) {
+          if (!$self->{exifTool}->WriteInfo($self->{file})) {
+            $self->{error} = $self->{exifTool}->{ERRSTR} || $self->{exifTool}->GetValue('Error') || $self->{exifTool}->GetValue('Warning') || 'No error message (possibly nothing to write)';
+            utils::logtResult('ERROR', $self->{shortname}, 'Critical', 'failed', $self->{error});
+            return;
+          }
+        }
+        utils::logtResult('FOOTER', $self->{shortname}, 'Finalize', 'apply', $ops);
+      } else {
+        $ops = utils::buildOperationsResult($self->{noop});
+        if ($ops ne '' && $verbose) {
+          utils::logTask('FOOTER', 'Finalize', 'noop', $ops);
+        }
+      }
+    }
+  }
+
+
+## Main ######################################################################################
+package main;
+use strict;
+use warnings;
+use File::Find::Rule;
+use File::Basename;
+
+  utils::init();
+  recurseProcess(@ARGV);
+  utils::shutdown();
+
+  sub validateItem {
+    my ($file) = @_;
+
+    my $target = $file;
+    if (-f $file) {
+      $target = dirname($file);
+    }
+    my ($dirTZ, $ignoreReason);
+    if (-f "$target/.noprocess") {
+      $ignoreReason = 'ignoring as ' . utils::addKeyValue('filename', undef, '.noprocess') . ' is present';
+    } else {
+      my ($tz_file) = File::Find::Rule->file->name(qr/^\.tz.*/i)->maxdepth(1)->in($target);
+      if (defined $tz_file) {
+        my $basename = basename($tz_file);
+        (my $name = $basename) =~ s/^\.tz//i;
+        my @words = $name =~ /[a-z0-9]+/gi;
+        $name = join '/', map { ucfirst lc } @words;
+        eval { $dirTZ = DateTime::TimeZone->new(name => $name); };
+        if ($@) { $ignoreReason = 'ignoring as ' . utils::addKeyValue('filename', undef, $basename) . ' does not match a valid TimeZone'; }
+      }
+    }
+    
+    my $item = Item->new($file, $dirTZ, $ignoreReason);
+    return $item;
+  }
+  
+  sub recurseProcess {
+    my ($file) = @_;
+
+    my $item = validateItem($file);
+    
+    if (defined $item->{ignoreReason}) {
+      checkItem($item);
+    } else {
+      my @files = File::Find::Rule->maxdepth(1)->mindepth(1)->file->in($file);
+      for my $f (@files) {
+        my $folderItem = Item->new($f, $item->{overrideTZ});
+        checkItem($folderItem) unless ($folderItem->{extension} =~ /^\.tz/i);
+      }
+    
+      my @dirs = File::Find::Rule->maxdepth(1)->directory->in($file);
+      for my $dir (@dirs) {
+        next unless ($dir ne $file);
+        recurseProcess($dir);
+      }
+
+      # current folder itself
+      checkItem($item) if (-d $file);
+    }
+  }
+  
+  sub checkItem {
+    my ($item) = @_;
+
+    utils::logTask('HEADER', undef, undef, "Processing $item->{type} '$item->{shortname}'");
+    if (defined $item->{ignoreReason}) {
+      utils::logtResult('WARN', $item->{shortname}, 'Folder', 'skipped', $item->{ignoreReason});
+      return;
+    } else {
+      if ($item->{type} eq $TYPE_IMAGE || $item->{type} eq $TYPE_VIDEO) {
+        $item->processFile();
+      } elsif ($item->{type} eq $TYPE_FOLDER) {
+        $item->processFolder();
+      #} else {
+      #  utils::logTask('FOOTER', 'Finalize', 'noop', 'unsupported filetype');
+      }
+      $item->applyOperations();
+    }
+  }
+
+
