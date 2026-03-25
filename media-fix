@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-our $VERSION = '1.0.6';
+our $VERSION = '1.0.7';
 
 # TODO possible bug when running with a single parameter
 # TODO bug with "preserve" not working, so have to rewrite FileModifyDate (can be confusing in the report)
@@ -231,7 +231,7 @@ use Image::ExifTool qw(ImageInfo);
     $dt->set_time_zone($convertOffset) if (defined $convertOffset);
     $offset = $dt->strftime('%z') =~ s/^([+-]\d{2})(\d{2})$/$1:$2/r;
     $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
-    my $dtStr = sprintf "%s.%03d%s", $date, substr($millis, 0, 3), $offset;
+    my $dtStr = sprintf "%s.%03d%s", $date, $millis, $offset;
 
     my $dtUTC = $dt->clone()->set_time_zone($UTC_TZ);
     my $dateUTC = sprintf "%s.%03d%s", $dtUTC->strftime('%Y:%m:%d %H:%M:%S'), int($dtUTC->nanosecond/1_000_000), "+00:00";
@@ -244,7 +244,7 @@ use Image::ExifTool qw(ImageInfo);
     $self->{target}->{millis}   = $millis;                                                                              # 421
     $self->{target}->{offset}   = $offset;                                                                              # +01:00
     $self->{target}->{asFile}   = $dt->strftime('%Y%m%d_%H%M%S');                                                       # 20220826_154119
-    $self->{target}->{asFileMS} = sprintf '%s.%03d', $self->{target}->{asFile}, substr($millis, 0, 3);                  # 20220826_154119.421
+    $self->{target}->{asFileMS} = sprintf '%s.%03d', $self->{target}->{asFile}, $millis;                                # 20220826_154119.421
     $self->{target}->{asUTC}    = $dateUTC;                                                                             # 2022:08:26 14:41:19.421+00:00
     $self->{target}->{asSystem} = $dateSystem;                                                                          # 2022:08:26 16:41:19+02:00        (stripping millis as not all filesystem supports them)
     
@@ -275,7 +275,8 @@ use Image::ExifTool qw(ImageInfo);
   ##
   sub getDateFromName {
     my ($self) = @_;
-    my $finalDate; my $finalMillis = 0; my $finalOffset;
+    
+    my $finalDate; my $finalMillis; my $finalOffset;
     if ($self->{type} eq $TYPE_FOLDER) {
       my ( $year, $month, $day ) = $self->{basename} =~ /(\d{4})(\d{0,2})(\d{0,2}).*/;
       if (!defined $year || $year eq '' || $year eq '0000') { $year = '2000'; }
@@ -309,8 +310,16 @@ use Image::ExifTool qw(ImageInfo);
       }
     }
     if (!defined $self->{target}) {
-      $self->setTargetDate($finalDate, $finalMillis, $finalOffset//$self->getDefaultTimezone());
-      utils::logTask('INFO', 'Filename', 'parse', 'matching timestamp extracted', 'targetDate', $self->{target}->{full});
+      if (!defined $finalMillis) {
+        $finalMillis = 0;
+        utils::logTask('WARN', 'Filename', 'parse', 'value is missing, using default', "SubSec", $finalMillis);
+      }
+      if (!defined $finalOffset) {
+        $finalOffset = $self->getDefaultTimezone();
+        utils::logTask('WARN', 'Filename', 'parse', 'value is missing, using default', "Offset", utils::getOffsetName($finalOffset));
+      }
+      $self->setTargetDate($finalDate, $finalMillis, $finalOffset);
+      utils::logTask('INFO', 'TargetDate', 'assign', 'extracted from filename', 'targetDate', $self->{target}->{full});
     }
   }
 
@@ -332,7 +341,7 @@ use Image::ExifTool qw(ImageInfo);
           my $targetOffset = $self->getDefaultTimezone();
           $self->setTargetDate($ExifDate, 0, $UTC_TZ, $targetOffset);
           utils::logTask('INFO', 'EXIF Tag', 'read', 'UTC Date', $dateTag, $ExifDate);
-          utils::logTask('INFO', 'TimeZone',  'conversion', "from 'UTC' to '$targetOffset->{name}'", 'targetDate', $self->{target}->{full});
+          utils::logTask('INFO', 'TargetDate', 'assign', "conversion from 'UTC' to '$targetOffset->{name}'", 'targetDate', $self->{target}->{full});
           $self->{needTag} = undef;
         } else {
           my ($ExifMillis, $ExifOffset, $msg, $value);
@@ -346,6 +355,7 @@ use Image::ExifTool qw(ImageInfo);
             }
           }
           if (defined $ExifMillis) {
+            $ExifMillis = substr($ExifMillis, 0, 3);
             $msg .= ", SubSec$extraTag";
             $value .= ", $ExifMillis";
           } else {
@@ -360,7 +370,8 @@ use Image::ExifTool qw(ImageInfo);
             utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using default', "Offset$extraTag", utils::getOffsetName($ExifOffset));
           }
           $self->setTargetDate($ExifDate, $ExifMillis, $ExifOffset);
-          utils::logTask('INFO', 'EXIF Tag', 'read', 'TZ Date', $msg, $value);
+          utils::logTask('INFO', 'EXIF Tag', 'read', 'Zoned Date', $msg, $value);
+          utils::logTask('INFO', 'TargetDate',  'assign', 'computed from EXIF tags', 'targetDate', $self->{target}->{full});
         }
       }
     } else {
@@ -627,5 +638,4 @@ use File::Basename;
       $item->applyOperations();
     }
   }
-
 
