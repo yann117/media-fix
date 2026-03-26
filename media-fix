@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-our $VERSION = '1.0.7';
+our $VERSION = '1.0.8';
 
 # TODO possible bug when running with a single parameter
 # TODO bug with "preserve" not working, so have to rewrite FileModifyDate (can be confusing in the report)
@@ -57,9 +57,9 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
     if ($rename || $touch || $tag || $xmp) {
       open(FH, '>', 'process.log') or die "Cannot open 'process.log' $!" if ($verbose);
       if ($tz) {
-        logTask('INFO', 'TimeZone', 'settings', 'system ' . addKeyValue('default', undef, $LOCAL_TZ->{name}) . ', overriden by parameter', '-tz', $DEFAULT_TZ->{name});
+        logTask('INFO', 'TimeZone', 'settings', 'system default ' . addValue($LOCAL_TZ->{name}) . " overriden by -tz parameter", 'Default Offset', $DEFAULT_TZ->{name});
       } else {
-        logTask('INFO', 'TimeZone', 'settings', 'system', 'default', $LOCAL_TZ->{name});
+        logTask('INFO', 'TimeZone', 'settings', 'system default', 'Default Offset', $LOCAL_TZ->{name});
       }
     } else {
       print "Usage:\n";
@@ -87,10 +87,8 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
   sub addValue { return "'\e[96m$_[0]\e[0m'"; }
   sub addKeyValue {
     my ($key, $sep, $value) = @_;
-    if (defined $value) {
-      return addHighlight($key) . $sep . addValue($value) if defined $sep;
-      return "'" . addHighlight($key) . "'=" . addValue($value);
-    }
+    $sep //= ' = ';
+    if (defined $value) { return addHighlight($key) . $sep . addValue($value); }
     else { return addHighlight($key); }
   }
 
@@ -260,14 +258,41 @@ use Image::ExifTool qw(ImageInfo);
 
     if ($tz) {
       $self->{defaultTZ} = $DEFAULT_TZ;
-      utils::logTask('INFO', 'TimeZone', 'settings', 'overriden by parameter', '-tz', $tz);
+      utils::logTask('INFO', 'TimeZone', 'override', "apply -tz parameter", 'Offset', $tz);
     } elsif (defined $self->{overrideTZ}) {
       $self->{defaultTZ} = $self->{overrideTZ};
-      utils::logTask('INFO', 'TimeZone', 'settings', 'overriden by folder configuration', 'blabla', $self->{overrideTZ}->name);
+      utils::logTask('INFO', 'TimeZone', 'override', "apply folder configuration", 'Offset', $self->{overrideTZ}->name);
     } else {
       $self->{defaultTZ} = $DEFAULT_TZ;
     }
     return $self->{defaultTZ};
+  }
+  
+  ##
+  # Compute an offset comparing a local referenceDate to the GPS Date in UTC
+  ##
+  sub computeGPSOffset {
+    my ($self, $referenceDate) = @_;
+
+    my $offset;
+    my $gpsDate = $self->{exifTool}->GetValue('GPSDateStamp');
+    my $gpsTime = $self->{exifTool}->GetValue('GPSTimeStamp');
+    if (defined $gpsDate && defined $gpsTime) {
+      my ($gy,$gm,$gd,$gH,$gM,$gS) = "$gpsDate $gpsTime" =~ /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
+      my $dtGPS = DateTime->new(year => $gy, month => $gm, day => $gd, hour => $gH, minute => $gM, second => $gS, time_zone => $UTC_TZ);
+      my ($ly,$lm,$ld,$lH,$lM,$lS,$subsec) = $referenceDate =~ /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
+      my $dtLocal = DateTime->new(year => $ly, month => $lm, day => $ld, hour => $lH, minute => $lM, second => $lS, time_zone => $UTC_TZ); # using same TZ for comparison
+
+      my $nbSec = $dtLocal->epoch - $dtGPS->epoch;
+      my $sign = $nbSec < 0 ? '-' : '+';
+      $nbSec = abs($nbSec);
+      my $hours = int($nbSec / 3600);
+      my $mins  = int(($nbSec % 3600) / 60);
+
+      $offset = sprintf("%s%02d:%02d", $sign, $hours, $mins);
+      utils::logTask('INFO', 'GPS Data',  'read', 'GPS Date', 'GPSDateStamp, GPSTimeStamp => Offset', "$gpsDate $gpsTime => $offset");
+    }
+    return $offset;
   }
   
   ##
@@ -290,7 +315,7 @@ use Image::ExifTool qw(ImageInfo);
           $remainder =~ s/(~\d+|_HDR|_\d+)$//i;
           if ($remainder ne '') {
             $self->{remainder} = $remainder;
-            utils::logTask('INFO', 'Filename', 'parse', 'partial name saved as', 'remainder', $remainder);
+            utils::logTask('INFO', 'Filename', 'parse', 'partial name saved as', 'Remainder', $remainder);
           }
         }
         $finalDate = sprintf "%04d:%02d:%02d %02d:%02d:%02d", $year, $month, $day, $hour, $min, $sec;
@@ -304,7 +329,7 @@ use Image::ExifTool qw(ImageInfo);
         utils::logTask('WARN', 'Filename', 'parse', 'not matching a timestamp');
         if (! $strict) {
           $self->{remainder} = ' ' . $self->{basename};
-          utils::logTask('INFO', 'Filename', 'parse', 'partial name saved as', 'remainder', $self->{remainder});
+          utils::logTask('INFO', 'Filename', 'parse', 'partial name saved as', 'Remainder', $self->{remainder});
         }
         return;
       }
@@ -315,11 +340,16 @@ use Image::ExifTool qw(ImageInfo);
         utils::logTask('WARN', 'Filename', 'parse', 'value is missing, using default', "SubSec", $finalMillis);
       }
       if (!defined $finalOffset) {
-        $finalOffset = $self->getDefaultTimezone();
-        utils::logTask('WARN', 'Filename', 'parse', 'value is missing, using default', "Offset", utils::getOffsetName($finalOffset));
+        $finalOffset = $self->computeGPSOffset($finalDate);
+        if (defined $finalOffset) {
+          utils::logTask('WARN', 'Filename', 'parse', 'value is missing, using GPS Date', 'Offset', utils::getOffsetName($finalOffset));
+        } else {
+          $finalOffset = $self->getDefaultTimezone();
+          utils::logTask('WARN', 'Filename', 'parse', 'value is missing, using default', "Offset", utils::getOffsetName($finalOffset));
+        }
       }
       $self->setTargetDate($finalDate, $finalMillis, $finalOffset);
-      utils::logTask('INFO', 'TargetDate', 'assign', 'extracted from filename', 'targetDate', $self->{target}->{full});
+      utils::logTask('INFO', 'TargetDate', 'assign', 'extracted from filename', 'TargetDate', $self->{target}->{full});
     }
   }
 
@@ -341,7 +371,7 @@ use Image::ExifTool qw(ImageInfo);
           my $targetOffset = $self->getDefaultTimezone();
           $self->setTargetDate($ExifDate, 0, $UTC_TZ, $targetOffset);
           utils::logTask('INFO', 'EXIF Tag', 'read', 'UTC Date', $dateTag, $ExifDate);
-          utils::logTask('INFO', 'TargetDate', 'assign', "conversion from 'UTC' to '$targetOffset->{name}'", 'targetDate', $self->{target}->{full});
+          utils::logTask('INFO', 'TargetDate', 'assign', "conversion from 'UTC' to '$targetOffset->{name}'", 'TargetDate', $self->{target}->{full});
           $self->{needTag} = undef;
         } else {
           my ($ExifMillis, $ExifOffset, $msg, $value);
@@ -366,12 +396,17 @@ use Image::ExifTool qw(ImageInfo);
             $msg .= ", Offset$extraTag";
             $value .= ', ' . utils::getOffsetName($ExifOffset);
           } else {
-            $ExifOffset = $self->getDefaultTimezone();
-            utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using default', "Offset$extraTag", utils::getOffsetName($ExifOffset));
+            $ExifOffset = $self->computeGPSOffset($ExifDate);
+            if (defined $ExifOffset) {
+              utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing ' . utils::addHighlight("Offset$extraTag") . ', using GPS Date', 'Offset', utils::getOffsetName($ExifOffset));
+            } else {
+              $ExifOffset = $self->getDefaultTimezone();
+              utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using default', "Offset$extraTag", utils::getOffsetName($ExifOffset));
+            }
           }
           $self->setTargetDate($ExifDate, $ExifMillis, $ExifOffset);
           utils::logTask('INFO', 'EXIF Tag', 'read', 'Zoned Date', $msg, $value);
-          utils::logTask('INFO', 'TargetDate',  'assign', 'computed from EXIF tags', 'targetDate', $self->{target}->{full});
+          utils::logTask('INFO', 'TargetDate',  'assign', 'computed from EXIF tags', 'TargetDate', $self->{target}->{full});
         }
       }
     } else {
@@ -388,7 +423,7 @@ use Image::ExifTool qw(ImageInfo);
     if (defined $extraTag) {
       $self->{exifTool}->SetNewValue('SubSec' . $extraTag => $self->{target}->{millis}, 'Protected' => 1);
       $self->{exifTool}->SetNewValue('Offset' . $extraTag => $self->{target}->{offset}, 'Protected' => 1);
-      utils::logTask('INFO', 'EXIF Tag', 'write', 'TZ Date', "$dateTag, SubSec$extraTag, Offset$extraTag", "$ExifDate, $self->{target}->{millis}, $self->{target}->{offset}");
+      utils::logTask('INFO', 'EXIF Tag', 'write', 'Zoned Date', "$dateTag, SubSec$extraTag, Offset$extraTag", "$ExifDate, $self->{target}->{millis}, $self->{target}->{offset}");
     } else {
       utils::logTask('INFO', 'EXIF Tag', 'write', 'UTC Date', $dateTag, $ExifDate);
     }
@@ -402,19 +437,19 @@ use Image::ExifTool qw(ImageInfo);
     my $shortTargetName = $self->{target}->{asFile} . ($self->{remainder}//'') . $self->{extension};
     my $shortMillisTargetName = $self->{target}->{asFileMS} . ($self->{remainder}//'') . $self->{extension};
     if ($self->{basename} . $self->{extension} eq $shortTargetName) {
-      utils::logTask('INFO', 'Filename', 'validate', 'is already correct', 'target', $shortTargetName);
+      utils::logTask('INFO', 'Filename', 'validate', 'is already correct', 'Target', $shortTargetName);
       return;
     }
     return $shortTargetName if (! -e $self->{path}.$shortTargetName);
 
     if ($self->{basename} . $self->{extension} eq $shortMillisTargetName) {
-      utils::logTask('INFO', 'Filename', 'validate', 'is already correct with millis', 'target', $shortMillisTargetName);
+      utils::logTask('INFO', 'Filename', 'validate', 'is already correct with millis', 'Target', $shortMillisTargetName);
       return;
     }
     if (! -e $self->{path}.$shortMillisTargetName) {
       return $shortMillisTargetName;
     } else {
-      utils::logTask('ERROR', 'Filename', 'validate', 'found duplicate item with same date.millis', 'target', $shortMillisTargetName);
+      utils::logTask('ERROR', 'Filename', 'validate', 'found duplicate item with same date.millis', 'Target', $shortMillisTargetName);
       return; # required or will return 1 from the previous statement
     }
   }
@@ -519,8 +554,8 @@ use Image::ExifTool qw(ImageInfo);
               my $xmpTool = Image::ExifTool->new;
               $xmpTool->SetNewValue('XMP-exif:DateTimeOriginal' => $self->{target}->{full});
               $xmpTool->WriteInfo(undef, $xmp_file)
-                or utils::logTask('ERROR', 'XMP file', 'write', 'file failed', 'error', $xmpTool->GetValue('Error'));
-              utils::logTask('INFO', 'XMP file', 'write', 'XMP-exif details to', 'file', "$self->{shortname}.xmp");
+                or utils::logTask('ERROR', 'XMP file', 'write', 'file failed', 'Error', $xmpTool->GetValue('Error'));
+              utils::logTask('INFO', 'XMP file', 'write', 'XMP-exif details to', 'File', "$self->{shortname}.xmp");
             }
             $self->{operations}->{xmp} = utils::addHighlight('XMP file written');
           } else {
