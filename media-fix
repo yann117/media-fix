@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-our $VERSION = '1.0.8';
+our $VERSION = '1.0.9';
 
 # TODO possible bug when running with a single parameter
 # TODO bug with "preserve" not working, so have to rewrite FileModifyDate (can be confusing in the report)
@@ -226,9 +226,11 @@ use Image::ExifTool qw(ImageInfo);
 
     my ($year, $month, $day, $hour, $min, $sec) = $date =~ /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
     my $dt = DateTime->new(year => $year, month => $month, day => $day, hour => $hour, minute => $min, second => $sec, nanosecond => ($millis * 1_000_000), time_zone => $offset);
-    $dt->set_time_zone($convertOffset) if (defined $convertOffset);
+    if (defined $convertOffset) {
+      $dt->set_time_zone($convertOffset);
+      $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
+    }
     $offset = $dt->strftime('%z') =~ s/^([+-]\d{2})(\d{2})$/$1:$2/r;
-    $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
     my $dtStr = sprintf "%s.%03d%s", $date, $millis, $offset;
 
     my $dtUTC = $dt->clone()->set_time_zone($UTC_TZ);
@@ -288,9 +290,12 @@ use Image::ExifTool qw(ImageInfo);
       $nbSec = abs($nbSec);
       my $hours = int($nbSec / 3600);
       my $mins  = int(($nbSec % 3600) / 60);
-
-      $offset = sprintf("%s%02d:%02d", $sign, $hours, $mins);
-      utils::logTask('INFO', 'GPS Data',  'read', 'GPS Date', 'GPSDateStamp, GPSTimeStamp => Offset', "$gpsDate $gpsTime => $offset");
+      if ($hours > 14) {
+        utils::logTask('WARN', 'GPS Data',  'read', 'invalid GPS Date', 'GPSDateStamp, GPSTimeStamp', "$gpsDate $gpsTime");
+      } else {
+        $offset = sprintf("%s%02d:%02d", $sign, $hours, $mins);
+        utils::logTask('INFO', 'GPS Data',  'read', 'GPS Date', 'GPSDateStamp, GPSTimeStamp => Offset', "$gpsDate $gpsTime => $offset");
+      }
     }
     return $offset;
   }
@@ -364,12 +369,14 @@ use Image::ExifTool qw(ImageInfo);
     my $ExifDate = $self->{exifTool}->GetValue($dateTag);
     if (defined $ExifDate) {
       # some bugged device report this false date
-      if ($ExifDate =~ /^2002:12:08 12:00:00/ || $ExifDate eq '0000:00:00 00:00:00' || $ExifDate eq '') {
+      if ($ExifDate =~ /^2002:12:08 12:00:00/ || $ExifDate =~ /^0000:00:00 00:00:00/ || $ExifDate eq '') {
         utils::logTask('WARN', 'EXIF Tag', 'read', 'value is invalid', $dateTag, $ExifDate);
       } else {
+        my ($year, $month, $day, $hour, $min, $sec, $millis, $offset) = $ExifDate =~ /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.?(\d{1,3})\d*)?([+-]\d{2}:\d{2})?$/;
+        my $finalDate = sprintf "%04d:%02d:%02d %02d:%02d:%02d", $year, $month, $day, $hour, $min, $sec;
         if ($self->{type} eq $TYPE_VIDEO) {
           my $targetOffset = $self->getDefaultTimezone();
-          $self->setTargetDate($ExifDate, 0, $UTC_TZ, $targetOffset);
+          $self->setTargetDate($finalDate, $millis//0, $UTC_TZ, $targetOffset);
           utils::logTask('INFO', 'EXIF Tag', 'read', 'UTC Date', $dateTag, $ExifDate);
           utils::logTask('INFO', 'TargetDate', 'assign', "conversion from 'UTC' to '$targetOffset->{name}'", 'TargetDate', $self->{target}->{full});
           $self->{needTag} = undef;
@@ -389,8 +396,8 @@ use Image::ExifTool qw(ImageInfo);
             $msg .= ", SubSec$extraTag";
             $value .= ", $ExifMillis";
           } else {
-            $ExifMillis = 0;
-            utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using default', "SubSec$extraTag", $ExifMillis);
+            $ExifMillis = $millis//0;
+            utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using', "SubSec$extraTag", $ExifMillis);
           }
           if (defined $ExifOffset) {
             $msg .= ", Offset$extraTag";
@@ -400,11 +407,11 @@ use Image::ExifTool qw(ImageInfo);
             if (defined $ExifOffset) {
               utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing ' . utils::addHighlight("Offset$extraTag") . ', using GPS Date', 'Offset', utils::getOffsetName($ExifOffset));
             } else {
-              $ExifOffset = $self->getDefaultTimezone();
-              utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using default', "Offset$extraTag", utils::getOffsetName($ExifOffset));
+              $ExifOffset = (defined $offset) ? $offset : $self->getDefaultTimezone();
+              utils::logTask('WARN', 'EXIF Tag', 'read', 'extratag is missing, using', "Offset$extraTag", utils::getOffsetName($ExifOffset));
             }
           }
-          $self->setTargetDate($ExifDate, $ExifMillis, $ExifOffset);
+          $self->setTargetDate($finalDate, $ExifMillis, $ExifOffset);
           utils::logTask('INFO', 'EXIF Tag', 'read', 'Zoned Date', $msg, $value);
           utils::logTask('INFO', 'TargetDate',  'assign', 'computed from EXIF tags', 'TargetDate', $self->{target}->{full});
         }
@@ -495,14 +502,16 @@ use Image::ExifTool qw(ImageInfo);
     } else {
       if ($self->{type} eq $TYPE_IMAGE) {
         $self->getDateFromEXIF('DateTimeOriginal', 'TimeOriginal');
+        $self->getDateFromEXIF('CreateDate', 'TimeDigitized');
+        $self->getDateFromEXIF('ModifyDate', 'Time');
       } else {
+        $self->getDateFromEXIF('CreateDate');
+        $self->getDateFromEXIF('ModifyDate');
         $self->getDateFromEXIF('MediaCreateDate');
         $self->getDateFromEXIF('MediaModifyDate');
         $self->getDateFromEXIF('TrackCreateDate');
         $self->getDateFromEXIF('TrackModifyDate');
       }
-      $self->getDateFromEXIF('CreateDate', 'TimeDigitized');
-      $self->getDateFromEXIF('ModifyDate', 'Time');
     }
     $self->getDateFromName();
     if (!defined $self->{target}) {
