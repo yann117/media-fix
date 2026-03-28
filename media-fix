@@ -5,30 +5,7 @@ our $VERSION = '1.0.9';
 # TODO possible bug when running with a single parameter
 # TODO bug with "preserve" not working, so have to rewrite FileModifyDate (can be confusing in the report)
 
-#### Specific Fixes ##########################################################################
-package fixes;
-  ##
-  # Fix for DJI Action Cam: bug with DST, 1h shift TODO
-  ##
-  sub fixDJIVideo {
-    my ($item) = @_;
-    my $isDJI;
-    my $tagDJI = $item->{exifTool}->GetValue('OriginalFilePath');
-    if ((defined $tagDJI) && ($tagDJI =~ /DJI/)) {
-      $isDJI = 1;
-    }
-  }
 
-  ##
-  # Fix for Panasonic Camera adding wrong MakerNotes timestamps -> Not needed when setting the File DateTimeOriginal
-  ##
-  sub fixPanasonicImage {
-    my ($item) = @_;
-    my $panasonicTime = $item->{exifTool}->GetValue('MakerNotes:Panasonic:TimeStamp');
-    if (defined $panasonicTime) {
-    }
-  }
-  
 ## Utilities #################################################################################
 package utils;
 use strict;
@@ -37,7 +14,7 @@ use Cwd 'abs_path';
 use Getopt::Long;
 use DateTime::TimeZone;
 
-our ($verbose, $rename, $strict, $touch, $tag, $skiptag, $xmp, $run, $tz);
+our ($verbose, $rename, $strict, $touch, $tag, $skiptag, $xmp, $fix, $run, $tz);
 
 our $TYPE_IMAGE    = 'image';
 our $TYPE_VIDEO    = 'video';
@@ -46,7 +23,7 @@ our $TYPE_FOLDER   = 'folder';
 our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
 
   sub init {
-    GetOptions('verbose' => \$verbose, 'rename' => \$rename, 'strict' => \$strict, 'touch' => \$touch, 'tag' => \$tag, 'skiptag' => \$skiptag, 'xmp' => \$xmp, 'run' => \$run, 'tz=s' => \$tz) or die "Invalid options\n";
+    GetOptions('verbose' => \$verbose, 'rename' => \$rename, 'strict' => \$strict, 'touch' => \$touch, 'tag' => \$tag, 'skiptag' => \$skiptag, 'xmp' => \$xmp, 'fix' => \$fix, 'run' => \$run, 'tz=s' => \$tz) or die "Invalid options\n";
     @ARGV = (abs_path('.')) unless @ARGV;
 
     $CWD = abs_path('.');
@@ -111,9 +88,9 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
     my $output;
     if ($level eq 'WARN') { $output .= "\e[93m"; }
     elsif ($level eq 'ERROR') { $output .= "\e[91m"; }
-    $output .= "'$shortname' " if defined $shortname;
     $output .= "\e[0m" if ($level eq 'WARN' || $level eq 'ERROR');
     $output .= "$msg";
+    $output .= "-> '$shortname'" if defined $shortname;
     $output .= "\n";
     
     print $output;
@@ -161,6 +138,36 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
   
   sub dateStringStripMillis { my $s = shift; $s =~ s/\.\d+//; $s }
   sub getOffsetName { return ref($_[0]) ? $_[0]->{name} : $_[0]; }
+
+
+#### Specific Fixes ##########################################################################
+package fixes;
+use strict;
+use warnings;
+
+  ##
+  # Fix for DJI Action Cam
+  ##
+  sub fixDJI {
+    my ($item, $dt) = @_;
+
+    if ($item->{type} eq $TYPE_IMAGE) {
+      my $tag = $item->{exifTool}->GetValue('XMP:Label');
+      if (defined $tag && $tag eq 'fixDJI') {
+        utils::logTask('INFO', 'Custom', 'identify', 'already applied', 'Fix', 'fixDJI');
+      } else {
+        $tag = $item->{exifTool}->GetValue('UniqueCameraModel');
+        if (defined $tag && $tag =~ /DJI/i) {
+          utils::logTask('INFO', 'Custom', 'identify', 'DJI image identified, adding 2h');
+          $item->{exifTool}->SetNewValue('XMP:Label' => 'fixDJI');
+          $item->{needTag} = 1;
+          $dt->add( hours => 2 );
+        }
+      }
+    }
+    # $tag = $item->{exifTool}->GetValue('OriginalFilePath'); for videos
+  }
+
 
 ## Class Item ################################################################################
 package Item;
@@ -223,13 +230,15 @@ use Image::ExifTool qw(ImageInfo);
   
   sub setTargetDate {
     my ($self, $date, $millis, $offset, $convertOffset) = @_;
-
     my ($year, $month, $day, $hour, $min, $sec) = $date =~ /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
     my $dt = DateTime->new(year => $year, month => $month, day => $day, hour => $hour, minute => $min, second => $sec, nanosecond => ($millis * 1_000_000), time_zone => $offset);
-    if (defined $convertOffset) {
-      $dt->set_time_zone($convertOffset);
-      $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
-    }
+
+    #if (defined $fix) {
+    #  fixes::fixDJI($self, $dt);
+    #}
+
+    $dt->set_time_zone($convertOffset) if defined $convertOffset;
+    $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
     $offset = $dt->strftime('%z') =~ s/^([+-]\d{2})(\d{2})$/$1:$2/r;
     my $dtStr = sprintf "%s.%03d%s", $date, $millis, $offset;
 
@@ -269,6 +278,24 @@ use Image::ExifTool qw(ImageInfo);
     }
     return $self->{defaultTZ};
   }
+  
+  ##
+  # Validate EXIF Offset
+  ##
+  sub validateOffset {
+    my ($self, $extraTag, $offset) = @_;
+    
+    if (defined $offset) {
+      eval { $offset = DateTime::TimeZone->new(name => $offset); };
+      if ($@) {
+        chomp $@;
+        utils::logTask('ERROR', 'EXIF Tag', 'read', 'extratag is invalid', "Offset$extraTag", $@);
+        return;
+      }
+    }
+    return $offset;
+  }
+    
   
   ##
   # Compute an offset comparing a local referenceDate to the GPS Date in UTC
@@ -386,7 +413,7 @@ use Image::ExifTool qw(ImageInfo);
           $value .= "$ExifDate";
           if (defined $extraTag) {
             $ExifMillis = $self->{exifTool}->GetValue('SubSec' . $extraTag);
-            $ExifOffset = $self->{exifTool}->GetValue('Offset' . $extraTag);
+            $ExifOffset = $self->validateOffset($extraTag, $self->{exifTool}->GetValue('Offset' . $extraTag));
             if (defined $ExifMillis && defined $ExifOffset) {
               $self->{needTag} = undef;
             }
@@ -505,12 +532,12 @@ use Image::ExifTool qw(ImageInfo);
         $self->getDateFromEXIF('CreateDate', 'TimeDigitized');
         $self->getDateFromEXIF('ModifyDate', 'Time');
       } else {
-        $self->getDateFromEXIF('CreateDate');
-        $self->getDateFromEXIF('ModifyDate');
         $self->getDateFromEXIF('MediaCreateDate');
         $self->getDateFromEXIF('MediaModifyDate');
         $self->getDateFromEXIF('TrackCreateDate');
         $self->getDateFromEXIF('TrackModifyDate');
+        $self->getDateFromEXIF('ModifyDate');
+        $self->getDateFromEXIF('CreateDate');
       }
     }
     $self->getDateFromName();
@@ -527,12 +554,12 @@ use Image::ExifTool qw(ImageInfo);
           $self->setDateToEXIF($ExifDate, 'CreateDate', 'TimeDigitized');
           $self->setDateToEXIF($ExifDate, 'ModifyDate', 'Time');
         } else {
-          $self->setDateToEXIF($ExifDate, 'QuickTime:CreateDate');
-          $self->setDateToEXIF($ExifDate, 'QuickTime:ModifyDate');
           $self->setDateToEXIF($ExifDate, 'QuickTime:MediaCreateDate');
           $self->setDateToEXIF($ExifDate, 'QuickTime:MediaModifyDate');
           $self->setDateToEXIF($ExifDate, 'QuickTime:TrackCreateDate');
           $self->setDateToEXIF($ExifDate, 'QuickTime:TrackModifyDate');
+          $self->setDateToEXIF($ExifDate, 'QuickTime:ModifyDate');
+          $self->setDateToEXIF($ExifDate, 'QuickTime:CreateDate');
           #$self->setDateToEXIF($self->{target}->{full}, "XMP-xmp:CreateDate"); Note: could possibly add this one
         }
         $self->{operations}->{tag} = utils::addKeyValue('tagged', ' to ', $self->{target}->{full});
