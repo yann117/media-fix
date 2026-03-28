@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-our $VERSION = '1.0.9';
+our $VERSION = '1.1.0';
 
 # TODO possible bug when running with a single parameter
 # TODO bug with "preserve" not working, so have to rewrite FileModifyDate (can be confusing in the report)
