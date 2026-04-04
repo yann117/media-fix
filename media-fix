@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-our $VERSION = '1.1.4';
+our $VERSION = '1.1.5';
 
 # TODO possible bug when running with a single parameter
 
@@ -32,11 +32,7 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
 
     if ($rename || $touch || $tag || $tagwoms || $xmp) {
       open(FH, '>', 'process.log') or die "Cannot open 'process.log' $!" if ($verbose);
-      if ($tz) {
-        logTask('INFO', 'TimeZone', 'settings', 'system default ' . addValue($LOCAL_TZ->{name}) . " overriden by -tz parameter", 'Default Offset', $DEFAULT_TZ->{name});
-      } else {
-        logTask('INFO', 'TimeZone', 'settings', 'system default', 'Default Offset', $LOCAL_TZ->{name});
-      }
+      logTask('INFO', 'TimeZone', 'settings', 'system default', 'Default Offset', $LOCAL_TZ->{name});
     } else {
       print "Usage:\n";
       print "    media-fix -tag|-touch|-rename|-xmp [-run][-strict][-skiptag][-tz='str'][-verbose] [FILE]\n";
@@ -200,7 +196,7 @@ use File::Basename qw(fileparse);
 use Image::ExifTool qw(ImageInfo);
 
   sub new {
-    my ($class, $file, $overrideTZ, $ignoreReason) = @_;
+    my ($class, $file, $dirTZ, $ignoreReason) = @_;
     die "file is required" unless $file;
    
     $file = abs_path($file);
@@ -212,6 +208,7 @@ use Image::ExifTool qw(ImageInfo);
         path            => $path,
         remainder       => undef,
         extension       => lc($suffix),
+        dirTZ           => $dirTZ,
         defaultTZ       => undef,
         type            => '',
         exiftool        => undef,
@@ -224,7 +221,6 @@ use Image::ExifTool qw(ImageInfo);
     };
 
     bless $self, $class;
-    $self->{defaultTZ} = $self->getDefaultTimezone($overrideTZ);
     $self->{exifTool} = new Image::ExifTool;
     if ($self->{exifTool}->ExtractInfo($self->{file})) {
       $self->{fileModifyDate} = utils::dateStringStripMillis($self->{exifTool}->GetValue('FileModifyDate'));
@@ -272,7 +268,7 @@ use Image::ExifTool qw(ImageInfo);
         $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
         $offset = $dt->strftime('%z') =~ s/^([+-]\d{2})(\d{2})$/$1:$2/r;
         $dtStr = sprintf "%s.%03d%s", $date, $millis, $offset;
-        utils::logTask('WARN', 'EXIF Tag', 'override', "Exif offset mismatch with configuration, appling", 'Offset', utils::getOffsetName($self->{defaultTZ}));
+        utils::logTask('WARN', 'EXIF Tag', 'override', "tag offset mismatch with expectation, appling", 'Offset', utils::getOffsetName($self->{defaultTZ}));
       }
     }
     
@@ -295,19 +291,19 @@ use Image::ExifTool qw(ImageInfo);
   }
  
   ##
-  # Get the default timezone from either: the host system, the -tz parameter, the presence of a .tz* file in the folder. Resolved and logged at first use.
+  # Init and log the default timezone from either: the host system, the -tz parameter, the presence of a .tz* file in the folder
   ##
-  sub getDefaultTimezone {
-    my ($self, $overrideTZ) = @_;
+  sub initDefaultTimezone {
+    my ($self) = @_;
 
     if ($tz) {
       utils::logTask('INFO', 'TimeZone', 'override', "apply -tz parameter", 'Offset', $tz);
-      return $DEFAULT_TZ;
-    } elsif (defined $overrideTZ) {
-      utils::logTask('INFO', 'TimeZone', 'override', "apply folder configuration", 'Offset', $overrideTZ->name);
-      return $overrideTZ;
+      $self->{defaultTZ} = $DEFAULT_TZ;
+    } elsif (defined $self->{dirTZ}) {
+      utils::logTask('INFO', 'TimeZone', 'override', "apply folder configuration", 'Offset', $self->{dirTZ}->name);
+      $self->{defaultTZ} = $self->{dirTZ};
     } else {
-      return $DEFAULT_TZ;
+      $self->{defaultTZ} = $DEFAULT_TZ;
     }
   }
 
@@ -709,7 +705,7 @@ use File::Basename;
     } else {
       my @files = File::Find::Rule->maxdepth(1)->mindepth(1)->file->in($file);
       for my $f (@files) {
-        my $folderItem = Item->new($f, $item->{defaultTZ});
+        my $folderItem = Item->new($f, $item->{dirTZ});
         checkItem($folderItem) unless ($folderItem->{extension} =~ /^\.tz/i);
       }
    
@@ -728,6 +724,7 @@ use File::Basename;
     my ($item) = @_;
 
     utils::logTask('HEADER', undef, undef, "Processing $item->{type} '$item->{shortname}'");
+    $item->initDefaultTimezone();
     if (defined $item->{ignoreReason}) {
       utils::logtResult('WARN', $item->{shortname}, ' Folder ', 'skipped', $item->{ignoreReason});
       return;
