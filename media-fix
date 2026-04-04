@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-our $VERSION = '1.1.5';
+our $VERSION = '1.1.6';
 
 # TODO possible bug when running with a single parameter
 
@@ -657,6 +657,26 @@ use Image::ExifTool qw(ImageInfo);
     }
   }
 
+  sub check {
+    my ($self) = @_;
+
+    utils::logTask('HEADER', undef, undef, "Processing $self->{type} '$self->{shortname}'");
+    if (defined $self->{ignoreReason}) {
+      utils::logtResult('WARN', $self->{shortname}, ' Folder ', 'skipped', $self->{ignoreReason});
+      return;
+    } else {
+      $self->initDefaultTimezone();
+      if ($self->{type} eq $TYPE_IMAGE || $self->{type} eq $TYPE_VIDEO) {
+        $self->processFile();
+      } elsif ($self->{type} eq $TYPE_FOLDER) {
+        $self->processFolder();
+      #} else {
+      #  utils::logTask('FOOTER', 'Finalize', 'noop', 'unsupported filetype');
+      }
+      $self->applyOperations();
+    }
+  }
+
 
 ## Main ######################################################################################
 package main;
@@ -701,12 +721,12 @@ use File::Basename;
     my $item = validateItem($file);
    
     if (defined $item->{ignoreReason}) {
-      checkItem($item);
+      $item->check();
     } else {
       my @files = File::Find::Rule->maxdepth(1)->mindepth(1)->file->in($file);
       for my $f (@files) {
         my $folderItem = Item->new($f, $item->{dirTZ});
-        checkItem($folderItem) unless ($folderItem->{extension} =~ /^\.tz/i);
+        $folderItem->check() unless ($folderItem->{extension} =~ /^\.tz/i);
       }
    
       my @dirs = File::Find::Rule->maxdepth(1)->directory->in($file);
@@ -716,26 +736,6 @@ use File::Basename;
       }
 
       # current folder itself
-      checkItem($item) if (-d $file);
-    }
-  }
-
-  sub checkItem {
-    my ($item) = @_;
-
-    utils::logTask('HEADER', undef, undef, "Processing $item->{type} '$item->{shortname}'");
-    $item->initDefaultTimezone();
-    if (defined $item->{ignoreReason}) {
-      utils::logtResult('WARN', $item->{shortname}, ' Folder ', 'skipped', $item->{ignoreReason});
-      return;
-    } else {
-      if ($item->{type} eq $TYPE_IMAGE || $item->{type} eq $TYPE_VIDEO) {
-        $item->processFile();
-      } elsif ($item->{type} eq $TYPE_FOLDER) {
-        $item->processFolder();
-      #} else {
-      #  utils::logTask('FOOTER', 'Finalize', 'noop', 'unsupported filetype');
-      }
-      $item->applyOperations();
+      $item->check() if (-d $file);
     }
   }
