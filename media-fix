@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-our $VERSION = '1.1.3';
+our $VERSION = '1.1.4';
 
 # TODO possible bug when running with a single parameter
 
@@ -213,7 +213,6 @@ use Image::ExifTool qw(ImageInfo);
         remainder       => undef,
         extension       => lc($suffix),
         defaultTZ       => undef,
-        overrideTZ      => $overrideTZ,
         type            => '',
         exiftool        => undef,
         fileModifyDate  => undef,             # WARNING: reading/writing this 'FileModifyDate' tag is using environment TZ
@@ -225,6 +224,7 @@ use Image::ExifTool qw(ImageInfo);
     };
 
     bless $self, $class;
+    $self->{defaultTZ} = $self->getDefaultTimezone($overrideTZ);
     $self->{exifTool} = new Image::ExifTool;
     if ($self->{exifTool}->ExtractInfo($self->{file})) {
       $self->{fileModifyDate} = utils::dateStringStripMillis($self->{exifTool}->GetValue('FileModifyDate'));
@@ -249,7 +249,8 @@ use Image::ExifTool qw(ImageInfo);
   }
 
   sub setTargetDate {
-    my ($self, $date, $millis, $offset, $convertOffset) = @_;
+    my ($self, $date, $millis, $offset, $isVideo) = @_;
+    $offset //= $self->{defaultTZ};
     my ($year, $month, $day, $hour, $min, $sec) = $date =~ /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/;
     my $dt = DateTime->new(year => $year, month => $month, day => $day, hour => $hour, minute => $min, second => $sec, nanosecond => ($millis * 1_000_000), time_zone => $offset);
 
@@ -258,21 +259,20 @@ use Image::ExifTool qw(ImageInfo);
     #  fixes::fixSMA526B($self, $dt);
     #}
 
-    $dt->set_time_zone($convertOffset) if defined $convertOffset;
+    $dt->set_time_zone($self->{defaultTZ}) if $isVideo;
     $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
     $offset = $dt->strftime('%z') =~ s/^([+-]\d{2})(\d{2})$/$1:$2/r;
     my $dtStr = sprintf "%s.%03d%s", $date, $millis, $offset;
 
-    my $dateOverrideTZ;
-    if (!defined $convertOffset && defined $self->{overrideTZ}) {
-      my $dtOverrideTZ = DateTime->new(year => $year, month => $month, day => $day, hour => $hour, minute => $min, second => $sec, nanosecond => ($millis * 1_000_000), time_zone => $self->{overrideTZ});
-      if ($dtOverrideTZ ne $dt) {
+    if (! $isVideo) {
+      my $expectedDt = DateTime->new(year => $year, month => $month, day => $day, hour => $hour, minute => $min, second => $sec, nanosecond => ($millis * 1_000_000), time_zone => $self->{defaultTZ});
+      if ($expectedDt ne $dt) {
         $self->{needTag} = 1;
-        $dt = $dtOverrideTZ;
+        $dt = $expectedDt;
         $date = $dt->strftime('%Y:%m:%d %H:%M:%S');
         $offset = $dt->strftime('%z') =~ s/^([+-]\d{2})(\d{2})$/$1:$2/r;
         $dtStr = sprintf "%s.%03d%s", $date, $millis, $offset;
-        utils::logTask('WARN', 'EXIF Tag', 'override', "Exif offset mismatch with folder configuration (applied)", 'Offset', $self->{overrideTZ}->name);
+        utils::logTask('WARN', 'EXIF Tag', 'override', "Exif offset mismatch with configuration, appling", 'Offset', utils::getOffsetName($self->{defaultTZ}));
       }
     }
     
@@ -298,19 +298,17 @@ use Image::ExifTool qw(ImageInfo);
   # Get the default timezone from either: the host system, the -tz parameter, the presence of a .tz* file in the folder. Resolved and logged at first use.
   ##
   sub getDefaultTimezone {
-    my ($self) = @_;
-    return $self->{defaultTZ} if $self->{defaultTZ};
+    my ($self, $overrideTZ) = @_;
 
     if ($tz) {
-      $self->{defaultTZ} = $DEFAULT_TZ;
       utils::logTask('INFO', 'TimeZone', 'override', "apply -tz parameter", 'Offset', $tz);
-    } elsif (defined $self->{overrideTZ}) {
-      $self->{defaultTZ} = $self->{overrideTZ};
-      utils::logTask('INFO', 'TimeZone', 'override', "apply folder configuration", 'Offset', $self->{overrideTZ}->name);
+      return $DEFAULT_TZ;
+    } elsif (defined $overrideTZ) {
+      utils::logTask('INFO', 'TimeZone', 'override', "apply folder configuration", 'Offset', $overrideTZ->name);
+      return $overrideTZ;
     } else {
-      $self->{defaultTZ} = $DEFAULT_TZ;
+      return $DEFAULT_TZ;
     }
-    return $self->{defaultTZ};
   }
 
   ##
@@ -409,8 +407,7 @@ use Image::ExifTool qw(ImageInfo);
         if (defined $finalOffset) {
           utils::logTask('WARN', 'Filename', '   parse', 'value is missing, using GPS Date', 'Offset', utils::getOffsetName($finalOffset));
         } else {
-          $finalOffset = $self->getDefaultTimezone();
-          utils::logTask('WARN', 'Filename', '   parse', 'value is missing, using default', "Offset", utils::getOffsetName($finalOffset));
+          utils::logTask('WARN', 'Filename', '   parse', 'value is missing, using default', "Offset", utils::getOffsetName($self->{defaultTZ}));
         }
       }
       $self->setTargetDate($finalDate, $finalMillis, $finalOffset);
@@ -435,10 +432,9 @@ use Image::ExifTool qw(ImageInfo);
         my ($year, $month, $day, $hour, $min, $sec, $millis, $offset) = $ExifDate =~ /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.?(\d{1,3})\d*)?([+-]\d{2}:\d{2})?$/;
         my $finalDate = sprintf "%04d:%02d:%02d %02d:%02d:%02d", $year, $month, $day, $hour, $min, $sec;
         if ($self->{type} eq $TYPE_VIDEO) {
-          my $targetOffset = $self->getDefaultTimezone();
           utils::logTask('INFO', 'EXIF Tag', '    read', 'UTC Date', $dateTag, $ExifDate);
-          $self->setTargetDate($finalDate, $millis//0, $UTC_TZ, $targetOffset);
-          utils::logTask('INFO', 'TargetDT', '  assign', "conversion from 'UTC' to '$targetOffset->{name}'", 'TargetDate', $self->{target}->{full});
+          $self->setTargetDate($finalDate, $millis//0, $UTC_TZ, 1);
+          utils::logTask('INFO', 'TargetDT', '  assign', "conversion from 'UTC' to '" . utils::getOffsetName($self->{defaultTZ}) . "'", 'TargetDate', $self->{target}->{full});
           $self->{needTag} = undef;
         } else {
           my ($ExifMillis, $ExifOffset, $msg, $value);
@@ -467,7 +463,7 @@ use Image::ExifTool qw(ImageInfo);
             if (defined $ExifOffset) {
               utils::logTask('WARN', 'EXIF Tag', '    read', 'extratag is missing ' . utils::addHighlight("Offset$extraTag") . ', using GPS Date', 'Offset', utils::getOffsetName($ExifOffset));
             } else {
-              $ExifOffset = (defined $offset) ? $offset : $self->getDefaultTimezone();
+              $ExifOffset = $offset//$self->{defaultTZ};
               utils::logTask('WARN', 'EXIF Tag', '    read', 'extratag is missing, using', "Offset$extraTag", utils::getOffsetName($ExifOffset));
             }
           }
@@ -678,7 +674,7 @@ use File::Basename;
   utils::shutdown();
 
   sub validateItem {
-    my ($file, $parentTZ) = @_;
+    my ($file) = @_;
 
     my $target = $file;
     if (-f $file) {
@@ -699,28 +695,28 @@ use File::Basename;
       }
     }
    
-    my $item = Item->new($file, $dirTZ//$parentTZ, $ignoreReason);
+    my $item = Item->new($file, $dirTZ, $ignoreReason);
     return $item;
   }
 
   sub recurseProcess {
-    my ($file, $parentTZ) = @_;
+    my ($file) = @_;
 
-    my $item = validateItem($file, $parentTZ);
+    my $item = validateItem($file);
    
     if (defined $item->{ignoreReason}) {
       checkItem($item);
     } else {
       my @files = File::Find::Rule->maxdepth(1)->mindepth(1)->file->in($file);
       for my $f (@files) {
-        my $folderItem = Item->new($f, $item->{overrideTZ});
+        my $folderItem = Item->new($f, $item->{defaultTZ});
         checkItem($folderItem) unless ($folderItem->{extension} =~ /^\.tz/i);
       }
    
       my @dirs = File::Find::Rule->maxdepth(1)->directory->in($file);
       for my $dir (@dirs) {
         next unless ($dir ne $file);
-        recurseProcess($dir, $item->{overrideTZ});
+        recurseProcess($dir);
       }
 
       # current folder itself
