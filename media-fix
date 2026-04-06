@@ -1,9 +1,8 @@
 #!/usr/bin/perl
 
-our $VERSION = '1.1.7';
+our $VERSION = '1.1.8';
 
 # TODO possible bug when running with a single parameter
-# TODO possibly log without colors
 
 
 ## Utilities #################################################################################
@@ -14,22 +13,21 @@ use Cwd 'abs_path';
 use Getopt::Long;
 use DateTime::TimeZone;
 
-our ($rename, $strict, $touch, $tag, $tagwoms, $skiptag, $xmp, $fix, $run, $skipimages, $skipvideos, $tz, $verbose, $log);
+our ($CWD, $LOCAL_TZ, $UTC_TZ, $PARAM_TZ, $rename, $strict, $touch, $tag, $tagwoms, $skiptag, $xmp, $fix, $run, $skipimages, $skipvideos, $norecurse, $verbose, $log);
 
 our $TYPE_IMAGE    = 'image';
 our $TYPE_VIDEO    = 'video';
 our $TYPE_FOLDER   = 'folder';
 
-our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
-
   sub init {
     GetOptions(
-      'rename' => \$rename, 'strict' => \$strict,
+      'rename' => \$rename, 'strict|s' => \$strict,
       'touch' => \$touch,
       'tag' => \$tag, 'tagwoms' => \$tagwoms, 'skiptag|st' => \$skiptag,
       'xmp' => \$xmp, 'fix' => \$fix,
       'run' => \$run, 'skipimages|si' => \$skipimages, 'skipvideos|sv' => \$skipvideos,
-      'tz=s' => \$tz,
+      'tz=s' => \$PARAM_TZ,
+      'norecurse|nr' => \$norecurse,
       'verbose|v' => \$verbose,
       'log' => \$log) or die "Invalid options\n";
     @ARGV = (abs_path('.')) unless @ARGV;
@@ -37,11 +35,11 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
     $CWD = abs_path('.');
     $UTC_TZ   = DateTime::TimeZone->new(name => 'UTC');
     $LOCAL_TZ = DateTime::TimeZone->new(name => 'local');
-    $DEFAULT_TZ = $tz ? DateTime::TimeZone->new(name => $tz) : $LOCAL_TZ;
+    $PARAM_TZ = DateTime::TimeZone->new(name => $PARAM_TZ) if defined $PARAM_TZ;
 
     if ($rename || $touch || $tag || $tagwoms || $xmp) {
       open(FH, '>', 'process.log') or die "Cannot open 'process.log' $!" if ($verbose && $log);
-      logTask('INFO', 'TimeZone', 'settings', 'system default', 'Default Offset', $LOCAL_TZ->{name});
+      logTask('INFO', 'TimeZone', 'settings', 'system default', 'Offset', $LOCAL_TZ->{name});
     } else {
       print "Usage:\n";
       print "    media-fix -tag|-touch|-rename|-xmp [-run][-strict][-skiptag][-tz='str'][-verbose] [FILE]\n";
@@ -101,7 +99,7 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
     $output .= "\n";
    
     print $output;
-    print FH $output if ($verbose && $log);
+    print FH stripANSI($output) if ($verbose && $log);
   }
 
   ##
@@ -129,7 +127,7 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
    
     if ($verbose) {
       print $output;
-      print FH $output if $log;
+      print FH stripANSI($output) if $log;
     }
   }
  
@@ -143,6 +141,7 @@ our ($CWD, $LOCAL_TZ, $UTC_TZ, $DEFAULT_TZ);
     }
   }
  
+  sub stripANSI { $_[0] =~ s/\e\[[\d;]*[mK]//gr }
   sub dateStringStripMillis { my $s = shift; $s =~ s/\.\d+//; $s }
   sub getOffsetName { return ref($_[0]) ? $_[0]->{name} : $_[0]; }
 
@@ -220,8 +219,7 @@ use Image::ExifTool qw(ImageInfo);
         path            => $path,
         remainder       => undef,
         extension       => lc($suffix),
-        dirTZ           => $dirTZ,
-        targetTZ        => undef,
+        targetTZ        => $dirTZ,
         type            => '',
         exiftool        => undef,
         fileModifyDate  => undef,             # WARNING: reading/writing this 'FileModifyDate' tag is using environment TZ
@@ -308,14 +306,13 @@ use Image::ExifTool qw(ImageInfo);
   sub initTargetTimezone {
     my ($self) = @_;
 
-    if ($tz) {
-      utils::logTask('INFO', 'TimeZone', 'override', "apply -tz parameter", 'Offset', $tz);
-      $self->{targetTZ} = $DEFAULT_TZ;
-    } elsif (defined $self->{dirTZ}) {
-      utils::logTask('INFO', 'TimeZone', 'override', "apply folder configuration", 'Offset', $self->{dirTZ}->name);
-      $self->{targetTZ} = $self->{dirTZ};
+    if ($PARAM_TZ) {
+      utils::logTask('INFO', 'TimeZone', 'override', "apply -tz parameter", 'Offset', utils::getOffsetName($PARAM_TZ));
+      $self->{targetTZ} = $PARAM_TZ;
+    } elsif (defined $self->{targetTZ}) {
+      utils::logTask('INFO', 'TimeZone', 'override', "apply folder configuration", 'Offset', $self->{targetTZ}->name);
     } else {
-      $self->{targetTZ} = $DEFAULT_TZ;
+      $self->{targetTZ} = $LOCAL_TZ;
     }
   }
 
@@ -708,7 +705,7 @@ use File::Basename;
   utils::shutdown();
 
   sub validateItem {
-    my ($file) = @_;
+    my ($file, $parentTZ) = @_;
 
     my $target = $file;
     if (-f $file) {
@@ -729,28 +726,30 @@ use File::Basename;
       }
     }
    
-    my $item = Item->new($file, $dirTZ, $ignoreReason);
+    my $item = Item->new($file, $dirTZ//$parentTZ, $ignoreReason);
     return $item;
   }
 
   sub recurseProcess {
-    my ($file) = @_;
+    my ($file, $parentTZ) = @_;
 
-    my $item = validateItem($file);
+    my $item = validateItem($file, $parentTZ);
    
     if (defined $item->{ignoreReason}) {
       $item->check();
     } else {
       my @files = File::Find::Rule->maxdepth(1)->mindepth(1)->file->in($file);
       for my $f (@files) {
-        my $folderItem = Item->new($f, $item->{dirTZ});
+        my $folderItem = Item->new($f, $item->{targetTZ});
         $folderItem->check() unless ($folderItem->{extension} =~ /^\.tz/i);
       }
-   
-      my @dirs = File::Find::Rule->maxdepth(1)->directory->in($file);
-      for my $dir (@dirs) {
-        next unless ($dir ne $file);
-        recurseProcess($dir);
+
+      if (! $norecurse) {
+        my @dirs = File::Find::Rule->maxdepth(1)->directory->in($file);
+        for my $dir (@dirs) {
+          next unless ($dir ne $file);
+          recurseProcess($dir, $item->{targetTZ});
+        }
       }
 
       # current folder itself
